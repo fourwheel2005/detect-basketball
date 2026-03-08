@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 3
+names: ['basketball', 'rim', 'sports ball']
+
+roboflow:
+  workspace: pipe-w4yhd
+  project: basketball-1zhpe-ihd5a
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/pipe-w4yhd/basketball-1zhpe-ihd5a/dataset/1
