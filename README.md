@@ -11,7 +11,7 @@
 * **[Fix] Data Structure & Coordinate Logic:** แก้ไขบั๊กการดึงพิกัด `(x, y)` จาก Tuple ในกฎ Traveling และ Carrying (`tuple object has no attribute y`) เพื่อให้รองรับพิกัด Pixel จริง (Global Coordinates) ที่แม่นยำขึ้น
 * **[Improvement] ROI to Global Transformation:** ปรับจูนระบบแปลงพิกัดกระดูกจากภาพตัด (ROI) กลับเป็นภาพรวมหน้าจอ (Global) ทำให้การคำนวณระยะห่างระหว่างมือกับลูกบาสแม่นยำ 100%
 
----
+--
 
 ## ✨ ฟีเจอร์หลัก (Features)
 ระบบสามารถตรวจจับเหตุการณ์ดังนี้:
