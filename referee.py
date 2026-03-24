@@ -1,23 +1,39 @@
 """
 referee.py — ศูนย์กลางการตัดสิน (Orchestrator)
 ------------------------------------------------
-BasketballRef รับข้อมูล Pose + Ball ของแต่ละผู้เล่น
-แล้วส่งต่อให้ Detector แต่ละตัว และรวบรวมผลลัพธ์
+กฎทั้งหมดที่ตรวจสอบ:
+    Rule 1 — Double Dribble   (State Machine)
+    Rule 2 — Traveling        (Peak Detection + Rolling Average)
+    Rule 3 — Carrying         (Wrist vs Index Y + Confirm Buffer)
+    Rule 4 — Goaltending      (Parabolic Trajectory Analysis)
+    Rule 5 — Jump Ball Foul   (Phase Detection + Velocity + Elbow Angle)
+    Rule 6 — Contact Foul     (3D CNN — ตีแขน / ชนตัว)
 """
 
-import numpy as np
 from utils import get_dist, AccuracyTracker
 from fouls.double_dribble import DoubleDribbleDetector
 from fouls.traveling      import TravelingDetector
 from fouls.carrying       import CarryingDetector
 from fouls.goaltending    import GoaltendingDetector
+# from fouls.jump_ball      import JumpBallDetector
+
+# Contact Foul (3D CNN) — import แบบ Optional
+# ถ้ายังไม่มี model ไฟล์ หรือยังไม่ได้ติดตั้ง tensorflow
+# ระบบจะข้าม Rule นี้โดยอัตโนมัติ ไม่ทำให้โปรแกรม crash
+try:
+    from fouls.contact_foul import ContactFoulDetector
+    CONTACT_FOUL_AVAILABLE = True
+except ImportError:
+    CONTACT_FOUL_AVAILABLE = False
+    print("⚠️  ContactFoulDetector ไม่พร้อมใช้งาน "
+          "(ติดตั้ง tensorflow และ train model ก่อน)")
 
 
 # ─────────────────────────────────────────────────────
-#  ฟังก์ชัน Module-level (อยู่นอก class — เรียกได้จากทุกที่)
+#  Pose Validity Check (Module-level function)
 # ─────────────────────────────────────────────────────
 
-_MAX_MISSING = 2  # ขาด Landmark หลักได้สูงสุดกี่จุดก่อนถือว่า Invalid
+_MAX_MISSING = 2  # ขาด Landmark หลักได้สูงสุดกี่จุด
 
 
 def _is_pose_valid(landmarks_px: dict, mp_pose) -> tuple:
@@ -25,9 +41,9 @@ def _is_pose_valid(landmarks_px: dict, mp_pose) -> tuple:
     ตรวจสอบว่า Pose มี Landmark สำคัญครบหรือไม่
     ถ้าไม่ครบ = น่าจะเป็น False Detection (มือ/แขนลอยๆ ไม่ใช่คน)
 
-    Parameters:
-        landmarks_px : dict {landmark_id (int): (x, y)}
-        mp_pose      : mediapipe.solutions.pose
+    Conditions:
+        1. Landmark หลัก 5 จุด ต้องขาดไม่เกิน _MAX_MISSING จุด
+        2. Aspect Ratio ต้องสูงกว่ากว้าง (คนยืน/เดิน)
 
     Returns:
         (is_valid: bool, reason: str)
@@ -40,13 +56,11 @@ def _is_pose_valid(landmarks_px: dict, mp_pose) -> tuple:
         mp_pose.PoseLandmark.RIGHT_HIP,
     ]
 
-    # ใช้ .value เพราะ landmarks_px key เป็น int ไม่ใช่ Enum
+    # ใช้ .value เพราะ key ใน landmarks_px เป็น int
     missing = [lm for lm in required if lm.value not in landmarks_px]
-
     if len(missing) > _MAX_MISSING:
         return False, f"Pose incomplete ({len(missing)} key points missing)"
 
-    # เช็ค Aspect Ratio: คนจริงต้องสูงกว่ากว้าง
     xs = [v[0] for v in landmarks_px.values()]
     ys = [v[1] for v in landmarks_px.values()]
     w  = max(xs) - min(xs)
@@ -59,7 +73,7 @@ def _is_pose_valid(landmarks_px: dict, mp_pose) -> tuple:
 
 
 # ─────────────────────────────────────────────────────
-#  Class หลัก
+#  BasketballRef — Main Orchestrator
 # ─────────────────────────────────────────────────────
 
 class BasketballRef:
@@ -68,42 +82,47 @@ class BasketballRef:
     และรวบรวม Violations + Info Texts ส่งกลับให้ main.py
 
     Attributes:
-        HOLDING_DIST (int): ระยะ (px) ที่ถือว่า "ถือบอล"
+        HOLDING_DIST (int) : ระยะ (px) ที่ถือว่า "ถือบอล"
+        _players     (dict): {player_id: {detector_key: DetectorInstance}}
+        _latest_landmarks  : {player_id: landmarks_px} — ใช้หา opponent
     """
 
-    HOLDING_DIST = 120  # pixel
+    HOLDING_DIST = 120  # px
 
     def __init__(self):
-        # dict ของ Detector แยกตาม Player ID
-        # {player_id: {"dd": ..., "tr": ..., "ca": ..., "gt": ...}}
-        self._players : dict = {}
-
-        # ระบบติดตามความแม่นยำ (shared ข้ามผู้เล่น)
-        self.accuracy = AccuracyTracker()
+        self._players           : dict = {}
+        self._latest_landmarks  : dict = {}
+        self.accuracy           = AccuracyTracker()
 
     # ─── Public API ───────────────────────────────────
 
     def process(self, player_id: int, landmarks_px: dict,
-                mp_pose, ball_box, frame_w: int, frame_h: int) -> tuple:
+                mp_pose, ball_box, frame_w: int, frame_h: int,
+                roi_bgr=None) -> tuple:
         """
         ประมวลผลผู้เล่น 1 คน ใน 1 เฟรม
 
         Parameters:
-            player_id   : int  — TrackID จาก YOLO
-            landmarks_px: dict — {landmark_id (int): (x, y)} Pixel coordinates
-            mp_pose     : mediapipe.solutions.pose module
+            player_id   : int   — TrackID จาก YOLO
+            landmarks_px: dict  — {landmark_id (int): (x, y)} Global Pixel
+            mp_pose     : mediapipe.solutions.pose
             ball_box    : array [x1, y1, x2, y2] หรือ None
             frame_w/h   : ขนาดเฟรม (pixel)
+            roi_bgr     : numpy array BGR ของผู้เล่น (สำหรับ 3D CNN)
+                          ถ้าไม่ส่งมา Rule 6 จะถูกข้าม
 
         Returns:
-            violations (list[str]): รายชื่อฟาวล์ที่พบ
-            info_texts (list[str]): ข้อมูล Debug เช่น "Steps: 1"
+            violations (list[str]) : รายชื่อฟาวล์ที่พบ
+            info_texts (list[str]) : ข้อมูล Debug / สถานะ
         """
-        # ── ด่านที่ 1: ตรวจสอบความสมบูรณ์ของ Pose ──
-        # ถ้า Landmark ไม่ครบ (เช่น เห็นแค่มือ/แขน) → ข้ามการตัดสิน
+        # ── ด่าน 1: ตรวจสอบ Pose ก่อนทำอะไรทั้งหมด ──
         is_valid, reason = _is_pose_valid(landmarks_px, mp_pose)
         if not is_valid:
             return [], [f"[SKIP] {reason}"]
+
+        # บันทึก landmarks ล่าสุดของผู้เล่นคนนี้
+        # (ใช้โดย _find_nearest_opponent สำหรับ Jump Ball)
+        self._latest_landmarks[player_id] = landmarks_px
 
         detectors  = self._get_detectors(player_id)
         violations : list = []
@@ -118,31 +137,69 @@ class BasketballRef:
         # ── ตรวจสอบว่าผู้เล่นถือบอลอยู่หรือไม่ ──
         is_holding = self._check_holding(landmarks_px, mp_pose, ball_center)
 
-        # ── Rule 1: Double Dribble ──
-        is_dd, msg_dd = detectors["dd"].check(landmarks_px, mp_pose, ball_center)
+        # ════════════════════════════════════════════
+        #  Rule 1: Double Dribble
+        # ════════════════════════════════════════════
+        is_dd, msg_dd = detectors["dd"].check(
+            landmarks_px, mp_pose, ball_center)
         self.accuracy.record("DOUBLE_DRIBBLE", is_dd)
         if is_dd:
             violations.append(msg_dd)
 
-        # ── Rule 2: Traveling ──
-        is_tr, msg_tr = detectors["tr"].check(landmarks_px, mp_pose, is_holding)
+        # ════════════════════════════════════════════
+        #  Rule 2: Traveling
+        # ════════════════════════════════════════════
+        is_tr, msg_tr = detectors["tr"].check(
+            landmarks_px, mp_pose, is_holding)
         self.accuracy.record("TRAVELING", is_tr)
         if is_tr:
             violations.append(msg_tr)
         elif msg_tr.startswith("Steps"):
             info_texts.append(msg_tr)
 
-        # ── Rule 3: Carrying ──
-        is_ca, msg_ca = detectors["ca"].check(landmarks_px, mp_pose, is_holding)
+        # ════════════════════════════════════════════
+        #  Rule 3: Carrying
+        # ════════════════════════════════════════════
+        is_ca, msg_ca = detectors["ca"].check(
+            landmarks_px, mp_pose, is_holding)
         self.accuracy.record("CARRYING", is_ca)
         if is_ca:
             violations.append(msg_ca)
 
-        # ── Rule 4: Goaltending (เฉพาะตอนถือบอลและบอลอยู่สูง) ──
+        # ════════════════════════════════════════════
+        #  Rule 4: Goaltending
+        # ════════════════════════════════════════════
         is_gt, msg_gt = detectors["gt"].check(ball_center, frame_h)
         self.accuracy.record("GOALTENDING", is_gt and is_holding)
         if is_gt and is_holding:
             violations.append(msg_gt)
+
+        # ════════════════════════════════════════════
+        #  Rule 5: Jump Ball Foul
+        # ════════════════════════════════════════════
+        #opponent_lm = self._find_nearest_opponent(player_id, landmarks_px)
+        #is_jb, msg_jb = detectors["jb"].check(
+         #   landmarks_px, mp_pose, opponent_lm)
+       # self.accuracy.record("JUMP_BALL_FOUL", is_jb)
+       # if is_jb:
+        #    violations.append(msg_jb)
+        #elif "Phase" in msg_jb:
+         #   info_texts.append(msg_jb)
+
+        # ════════════════════════════════════════════
+        #  Rule 6: Contact Foul (3D CNN)
+        #  ทำงานเฉพาะเมื่อ:
+        #    - CONTACT_FOUL_AVAILABLE = True (โหลด model สำเร็จ)
+        #    - roi_bgr ถูกส่งมาจาก main.py
+        # ════════════════════════════════════════════
+        if CONTACT_FOUL_AVAILABLE and roi_bgr is not None:
+            is_cf, msg_cf = detectors["cf"].check(roi_bgr)
+            self.accuracy.record("CONTACT_FOUL", is_cf)
+            if is_cf:
+                violations.append(msg_cf)
+        else:
+            # ยังไม่มี model → ข้ามเงียบๆ ไม่แจ้งเตือนทุกเฟรม
+            self.accuracy.record("CONTACT_FOUL", False)
 
         # แสดงสถานะ Holding เป็น Info
         if is_holding:
@@ -150,32 +207,50 @@ class BasketballRef:
 
         return violations, info_texts
 
+    def cleanup_player(self, player_id: int):
+        """
+        เรียกเมื่อ Player ID หายออกจากเฟรม
+        - Reset JumpBallDetector (Baseline ข้อเท้า)
+        - ลบ landmarks ออกจาก cache
+
+        ควรเรียกจาก main.py เมื่อ valid_ids ลดลง
+        """
+      #  if player_id in self._players:
+         #   self._players[player_id]["jb"].reset()
+        self._latest_landmarks.pop(player_id, None)
+
     # ─── Private Helpers ──────────────────────────────
 
     def _get_detectors(self, player_id: int) -> dict:
         """
         ดึง (หรือสร้างใหม่) ชุด Detectors สำหรับผู้เล่นคนนั้น
-        แยก Instance ต่อผู้เล่น เพื่อไม่ให้ State ปนกัน
+        แยก Instance ต่อผู้เล่น → State ไม่ปนกัน
         """
         if player_id not in self._players:
-            self._players[player_id] = {
+            detectors = {
                 "dd": DoubleDribbleDetector(),
                 "tr": TravelingDetector(),
                 "ca": CarryingDetector(),
                 "gt": GoaltendingDetector(),
+                #"jb": JumpBallDetector(),
             }
+            # เพิ่ม Contact Foul เฉพาะเมื่อพร้อม
+            if CONTACT_FOUL_AVAILABLE:
+                detectors["cf"] = ContactFoulDetector()
+
+            self._players[player_id] = detectors
+
         return self._players[player_id]
 
     def _check_holding(self, landmarks_px: dict, mp_pose,
                        ball_center) -> bool:
         """
         ตรวจสอบว่าผู้เล่นถือบอลหรือไม่
-        โดยดูระยะห่างระหว่างข้อมือกับจุดกึ่งกลางบอล
+        เช็คระยะห่างระหว่างข้อมือกับจุดกึ่งกลางบอล
         """
         if ball_center is None:
             return False
 
-        # ใช้ .value เพราะ key ใน landmarks_px เป็น int
         r_key = mp_pose.PoseLandmark.RIGHT_WRIST.value
         l_key = mp_pose.PoseLandmark.LEFT_WRIST.value
 
@@ -187,3 +262,35 @@ class BasketballRef:
 
         return (get_dist(r_wrist, ball_center) < self.HOLDING_DIST or
                 get_dist(l_wrist, ball_center) < self.HOLDING_DIST)
+
+    def _find_nearest_opponent(self, player_id: int,
+                                my_landmarks: dict):
+        """
+        ค้นหาผู้เล่นที่อยู่ใกล้ที่สุดเพื่อใช้เป็น opponent
+        สำหรับ JumpBallDetector ตรวจ Push contact
+
+        ใช้ LEFT_HIP (id=23) เป็นจุดกึ่งกลางตัว
+        คืน None ถ้าไม่มีผู้เล่นอื่น หรืออยู่ไกลเกิน 300px
+        """
+        my_hip = my_landmarks.get(23)   # LEFT_HIP.value = 23
+        if my_hip is None:
+            return None
+
+        nearest_lm   = None
+        nearest_dist = float('inf')
+
+        for pid, lm in self._latest_landmarks.items():
+            if pid == player_id:
+                continue
+
+            opp_hip = lm.get(23)
+            if opp_hip is None:
+                continue
+
+            d = get_dist(my_hip, opp_hip)
+            if d < nearest_dist:
+                nearest_dist = d
+                nearest_lm   = lm
+
+        # ไกลเกิน 300px = ไม่ใช่คู่ Jump Ball
+        return nearest_lm if nearest_dist <= 300 else None

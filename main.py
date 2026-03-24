@@ -1,21 +1,23 @@
 """
-main.py — AI Basketball Referee (Final Clean Version)
-======================================================
+main.py — AI Basketball Referee (Complete Version)
+===================================================
 ระบบ AI ตรวจจับฟาวล์บาสเกตบอลแบบ Real-time ด้วย:
     - YOLOv8         : ตรวจจับผู้เล่นและลูกบอล
     - MediaPipe Pose : วิเคราะห์ท่าทางร่างกาย
-    - Rule Engine    : ตรวจสอบกฎ Traveling / Carrying /
-                       Double Dribble / Goaltending
+    - Rule Engine    : 6 กฎ (Traveling / Carrying / Double Dribble /
+                       Goaltending / Jump Ball / Contact Foul)
 
 ฟีเจอร์:
     ✅ บันทึก Log ลง CSV
-    ✅ แสดง Accuracy Report หลัง Session จบ
-    ✅ กรอง Noise มือบังหน้า ด้วย IoU + Stability Filter
-    ✅ โค้ดสะอาด อ่านง่าย Comment ทุกจุด
+    ✅ Accuracy Report หลัง Session จบ
+    ✅ Noise Filtering 3 ด่าน (IoU + Stability + Pose Valid)
+    ✅ รองรับกล้องมือถือผ่าน IP Webcam
+    ✅ cleanup_player() เมื่อผู้เล่นออกจากเฟรม
+    ✅ ส่ง roi_bgr ให้ Contact Foul (3D CNN) อัตโนมัติ
 
 Controls:
-    q  — ออกจากโปรแกรม
-    r  — รีเซ็ต Accuracy Tracker
+    q  — ออก (พิมพ์ Accuracy Report)
+    r  — Reset Accuracy Tracker
 """
 
 import cv2
@@ -28,16 +30,63 @@ from utils   import (FoulLogger, PlayerStabilityFilter,
 
 
 # ════════════════════════════════════════════════════
-#  Config — ปรับค่าได้ที่นี่ที่เดียว
+#  Config — ปรับค่าทั้งหมดที่นี่ที่เดียว
 # ════════════════════════════════════════════════════
 
-CAMERA_INDEX  = 0      # 0 = Webcam หลัก
+# ── แหล่งกล้อง ──
+# "webcam"  = กล้องคอม
+# "phone"   = มือถือผ่าน IP Webcam (Android) / DroidCam
+CAMERA_SOURCE = "webcam"
+
+CAMERA_INDEX  = 0     # ใช้เมื่อ CAMERA_SOURCE = "webcam"
+
+# IP Webcam — ดู IP จากแอปแล้วใส่ตรงนี้
+PHONE_IP      = "192.168.1.5"
+PHONE_PORT    = 8080
+PHONE_URL     = f"http://{PHONE_IP}:{PHONE_PORT}/video"
+
 FRAME_WIDTH   = 1280
 FRAME_HEIGHT  = 720
-YOLO_CONF     = 0.35   # ความมั่นใจขั้นต่ำของ YOLO
+YOLO_CONF     = 0.35    # Confidence ขั้นต่ำของ YOLO
 LOG_FILE      = "basketball_foul_logs.csv"
-LOG_COOLDOWN  = 3.0    # วินาที — ป้องกัน Log ซ้ำรัวๆ
-FLIP_CAMERA   = True   # True = กล้องหน้า (Mirror)
+LOG_COOLDOWN  = 3.0     # วินาที — ป้องกัน Log ซ้ำรัวๆ
+FLIP_CAMERA   = True    # True = กล้องหน้า (Mirror) — ปิดเมื่อใช้กล้องมือถือ
+
+
+# ════════════════════════════════════════════════════
+#  ฟังก์ชันเปิดกล้อง
+# ════════════════════════════════════════════════════
+
+def open_camera() -> cv2.VideoCapture:
+    """
+    เปิดกล้องตาม CAMERA_SOURCE
+    รองรับ: webcam, phone (IP Webcam / DroidCam)
+
+    Returns:
+        cv2.VideoCapture หรือ None ถ้าเปิดไม่ได้
+    """
+    if CAMERA_SOURCE == "phone":
+        print(f"📱 Connecting to phone camera: {PHONE_URL}")
+        cap = cv2.VideoCapture(PHONE_URL)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # ลด Latency
+    else:
+        print(f"💻 Opening webcam index: {CAMERA_INDEX}")
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+    if not cap.isOpened():
+        if CAMERA_SOURCE == "phone":
+            print("❌ เชื่อมต่อมือถือไม่ได้ — ตรวจสอบ:")
+            print(f"   1. มือถือและคอมอยู่ WiFi เดียวกัน")
+            print(f"   2. IP ถูกต้อง: {PHONE_IP}")
+            print(f"   3. กด 'Start server' ในแอป IP Webcam แล้ว")
+        else:
+            print(f"❌ ไม่พบกล้อง index {CAMERA_INDEX}")
+        return None
+
+    print("✅ Camera connected!")
+    return cap
 
 
 # ════════════════════════════════════════════════════
@@ -46,18 +95,16 @@ FLIP_CAMERA   = True   # True = กล้องหน้า (Mirror)
 
 def draw_player(frame, box, player_id, violations, info_texts):
     """
-    วาด UI สำหรับผู้เล่น 1 คน: กรอบ, ข้อมูล, ฟาวล์
+    วาด UI สำหรับผู้เล่น 1 คน: กรอบ, ข้อมูล Debug, Violation Banner
 
     Parameters:
         frame      : frame หลัก (BGR)
-        box        : (x1, y1, x2, y2) bounding box ของผู้เล่น
+        box        : (x1, y1, x2, y2)
         player_id  : int
-        violations : list[str] — ฟาวล์ที่ตรวจพบ
-        info_texts : list[str] — ข้อมูล Debug เช่น Steps
+        violations : list[str]
+        info_texts : list[str]
     """
     x1, y1, x2, y2 = map(int, box)
-
-    # สี: เขียว = ปกติ, แดง = ฟาวล์
     color = (0, 0, 255) if violations else (0, 220, 80)
 
     # กรอบผู้เล่น
@@ -67,31 +114,28 @@ def draw_player(frame, box, player_id, violations, info_texts):
     cv2.putText(frame, f"P{player_id}", (x1 + 4, y2 - 6),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
-    # Info Texts (Steps, State, ฯลฯ) — แสดงเหนือกรอบ
+    # Info Texts เหนือกรอบ (กรอง [SKIP] ออก)
     label_y = y1 - 10
     for info in info_texts:
-        # กรอง [SKIP] ออก ไม่แสดงบนหน้าจอ (ดูใน Terminal แทน)
         if info.startswith("[SKIP]"):
             continue
         cv2.putText(frame, info, (x1, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 230, 50), 2)
-        label_y -= 22
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 230, 50), 2)
+        label_y -= 20
 
-    # Violation Banner — แสดงถ้ามีฟาวล์
+    # Violation Banner พร้อมพื้นหลังกึ่งโปร่งใส
     if violations:
         text = " + ".join(violations)
-        font        = cv2.FONT_HERSHEY_SIMPLEX
-        scale, thick = 0.8, 2
-        (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+        font         = cv2.FONT_HERSHEY_SIMPLEX
+        scale, thick = 0.75, 2
+        (tw, th), _  = cv2.getTextSize(text, font, scale, thick)
 
-        # พื้นหลังกึ่งโปร่งใส
         overlay = frame.copy()
         cv2.rectangle(overlay,
                       (x1, y1 - th - 16),
                       (x1 + tw + 8, y1 - 4),
                       (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
-
         cv2.putText(frame, text, (x1 + 4, y1 - 8),
                     font, scale, (0, 80, 255), thick)
 
@@ -105,8 +149,9 @@ def draw_ball(frame, ball_box):
 
 
 def draw_hud(frame, frame_count, num_players):
-    """แสดง HUD มุมซ้ายบน"""
-    cv2.putText(frame, f"Frame: {frame_count}  Players: {num_players}",
+    """HUD มุมซ้ายบน"""
+    cv2.putText(frame,
+                f"Frame: {frame_count}  Players: {num_players}",
                 (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
 
@@ -131,19 +176,16 @@ def main():
     # ── เตรียม Systems ──
     referee   = BasketballRef()
     logger    = FoulLogger(filename=LOG_FILE, cooldown_sec=LOG_COOLDOWN)
-    stability = PlayerStabilityFilter()   # กรอง ID กระพริบ (สร้างครั้งเดียวนอก Loop)
+    stability = PlayerStabilityFilter()
 
     # ── เปิดกล้อง ──
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-
-    if not cap.isOpened():
-        print("❌ ไม่สามารถเปิดกล้องได้ ตรวจสอบ CAMERA_INDEX")
+    cap = open_camera()
+    if cap is None:
         return
 
     print("✅ System Ready! กด 'q' เพื่อออก, 'r' เพื่อ Reset Accuracy")
-    frame_count = 0
+    frame_count      = 0
+    prev_valid_ids   = set()   # ใช้ตรวจจับ Player ID ที่หายออกไป
 
     # ════════════════════════════════════════════════
     #  Main Loop
@@ -161,7 +203,7 @@ def main():
         frame_count += 1
         referee.accuracy.tick_frame()
 
-        # ── YOLO: ตรวจจับผู้เล่น (class 0) และบอล (class 32) ──
+        # ── YOLO: ตรวจจับผู้เล่น (class 0) + บอล (class 32) ──
         results = model.track(
             frame,
             persist=True,
@@ -180,31 +222,38 @@ def main():
             ids     = results[0].boxes.id.cpu().numpy().astype(int)
 
             for box, cls, pid in zip(boxes, classes, ids):
-                if int(cls) == 32:      # ลูกบอล
+                if int(cls) == 32:
                     ball_box = box
                     draw_ball(frame, box)
-                elif int(cls) == 0:     # ผู้เล่น
+                elif int(cls) == 0:
                     person_boxes.append(box)
                     person_ids.append(pid)
 
-        # ── ด่านที่ 1: กรอง Box ที่ซ้อนทับกัน (มือบังหน้า) ──
+        # ── ด่าน 1: กรอง Box ซ้อนทับ (มือบังหน้า → YOLO นับเป็นคน) ──
         person_boxes, person_ids = filter_duplicate_boxes(
             person_boxes, person_ids, iou_threshold=0.4
         )
 
-        # ── ด่านที่ 2: กรอง ID ที่กระพริบ (Noise จากมือ/แขน) ──
+        # ── ด่าน 2: กรอง ID กระพริบ (Noise จากมือ/แขน) ──
         valid_ids    = stability.update(person_ids)
         filtered     = [(b, p) for b, p in zip(person_boxes, person_ids)
                         if p in valid_ids]
         person_boxes = [x[0] for x in filtered]
         person_ids   = [x[1] for x in filtered]
 
+        # ── Cleanup: Player ID ที่หายออกจากเฟรมนี้ ──
+        # Reset JumpBallDetector Baseline และลบ landmarks cache
+        disappeared_ids = prev_valid_ids - set(person_ids)
+        for gone_id in disappeared_ids:
+            referee.cleanup_player(gone_id)
+        prev_valid_ids = set(person_ids)
+
         # ── Process ผู้เล่นทีละคน ──
         for box, pid in zip(person_boxes, person_ids):
             x1, y1, x2, y2 = map(int, box)
-            margin = 30  # ขยาย ROI เล็กน้อยเพื่อให้ Pose มีข้อมูลรอบข้าง
 
-            # กำหนดขอบเขต ROI ไม่ให้เกินขอบ Frame
+            # ขยาย ROI เล็กน้อยเพื่อให้ MediaPipe มีบริบทรอบข้าง
+            margin = 30
             px1 = max(0, x1 - margin)
             py1 = max(0, y1 - margin)
             px2 = min(frame_w, x2 + margin)
@@ -221,25 +270,27 @@ def main():
             if not pose_result.pose_landmarks:
                 continue
 
-            # วาดโครงกระดูกบน ROI
-            mp_drawing.draw_landmarks(roi, pose_result.pose_landmarks,
-                                      mp_pose.POSE_CONNECTIONS)
+            # วาดโครงกระดูกบน ROI (แสดงบนภาพหลักด้วย)
+            mp_drawing.draw_landmarks(
+                roi, pose_result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-            # ── แปลงพิกัด Landmark: Normalized ROI → Global Pixel ──
+            # ── แปลงพิกัด: Normalized ROI → Global Pixel ──
             roi_h, roi_w, _ = roi.shape
             landmarks_px    = {}
 
             for idx, lm in enumerate(pose_result.pose_landmarks.landmark):
-                # Normalized (0–1) × ขนาด ROI = Pixel ใน ROI
+                # ขั้น 1: Normalized × ขนาด ROI = Pixel ใน ROI
                 cx = int(lm.x * roi_w)
                 cy = int(lm.y * roi_h)
-                # บวก Offset ของ ROI = Pixel ในภาพหลัก
+                # ขั้น 2: บวก ROI offset = Global Pixel ของภาพหลัก
                 landmarks_px[idx] = (cx + px1, cy + py1)
 
-            # ── ด่านที่ 3: ส่งให้ Referee ตัดสิน (_is_pose_valid อยู่ใน referee.py) ──
+            # ── ด่าน 3: ส่งให้ Referee ตัดสิน ──
+            # ส่ง roi (BGR) ด้วยเพื่อให้ ContactFoulDetector (3D CNN) ใช้งานได้
             violations, info_texts = referee.process(
                 pid, landmarks_px, mp_pose,
-                ball_box, frame_w, frame_h
+                ball_box, frame_w, frame_h,
+                roi_bgr=roi        # ← 3D CNN จะใช้ตรงนี้
             )
 
             # ── บันทึก Log ถ้ามีฟาวล์ ──
@@ -269,9 +320,8 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
-    # 📊 พิมพ์รายงานความแม่นยำหลัง Session จบ
     referee.accuracy.print_report()
-    print(f"📁 Log ถูกบันทึกไว้ที่: {LOG_FILE}")
+    print(f"📁 Log บันทึกไว้ที่: {LOG_FILE}")
 
 
 if __name__ == "__main__":

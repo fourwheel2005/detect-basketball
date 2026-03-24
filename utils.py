@@ -1,14 +1,15 @@
 """
-utils.py — ฟังก์ชันและคลาสช่วยเหลือสำหรับระบบ AI Basketball Referee
------------------------------------------------------------------------
+utils.py — ฟังก์ชันและคลาสช่วยเหลือ
+--------------------------------------
 ประกอบด้วย:
-  - get_dist()              : คำนวณระยะห่างระหว่าง 2 จุด
-  - calculate_angle()       : คำนวณมุมจาก 3 จุด
-  - compute_iou()           : คำนวณ Intersection over Union
-  - filter_duplicate_boxes(): กรอง Box ซ้อนทับ (ลด False Person Detection)
-  - PlayerStabilityFilter   : กรอง Player ID ที่กระพริบ (Noise)
-  - FoulLogger              : บันทึกฟาวล์ลง CSV พร้อม Cooldown
-  - AccuracyTracker         : ติดตามและรายงานความแม่นยำหลัง Run
+  - get_dist()              : ระยะห่าง Euclidean
+  - calculate_angle()       : มุมจาก 3 จุด
+  - compute_iou()           : Intersection over Union
+  - filter_duplicate_boxes(): กรอง Box ซ้อนทับ
+  - filter_mirror_boxes()   : กรอง เงาในกระจก/สะท้อน  ← ใหม่
+  - PlayerStabilityFilter   : กรอง ID กระพริบ
+  - FoulLogger              : บันทึก CSV
+  - AccuracyTracker         : รายงานความแม่นยำ
 """
 
 import numpy as np
@@ -19,101 +20,151 @@ from collections import defaultdict
 
 
 # ─────────────────────────────────────────────────────
-#  ฟังก์ชันคณิตศาสตร์พื้นฐาน
+#  คณิตศาสตร์พื้นฐาน
 # ─────────────────────────────────────────────────────
 
 def get_dist(p1, p2) -> float:
-    """
-    คำนวณระยะทาง Euclidean ระหว่างจุด 2 จุด (หน่วย: Pixel)
-
-    Parameters:
-        p1, p2: tuple หรือ array-like ที่มี (x, y)
-
-    Returns:
-        float: ระยะห่าง
-    """
+    """ระยะทาง Euclidean ระหว่าง 2 จุด (pixel)"""
     return float(np.linalg.norm(np.array(p1[:2]) - np.array(p2[:2])))
 
 
 def calculate_angle(a, b, c) -> float:
     """
-    คำนวณมุมที่จุด b โดยมี a–b–c เป็น 3 จุดอ้างอิง
-
-    Parameters:
-        a, b, c: tuple (x, y) ของแต่ละข้อต่อ
-
-    Returns:
-        float: มุมในหน่วยองศา (0–180)
+    มุมที่จุด b (องศา 0–180)
+    a, b, c: tuple (x, y) ของข้อต่อแต่ละจุด
     """
     a, b, c = np.array(a[:2]), np.array(b[:2]), np.array(c[:2])
-    radians = (np.arctan2(c[1] - b[1], c[0] - b[0])
-               - np.arctan2(a[1] - b[1], a[0] - b[0]))
+    radians = (np.arctan2(c[1]-b[1], c[0]-b[0])
+               - np.arctan2(a[1]-b[1], a[0]-b[0]))
     angle = abs(np.degrees(radians))
     return 360.0 - angle if angle > 180.0 else angle
 
 
 # ─────────────────────────────────────────────────────
-#  IoU และ Box Deduplication — แก้ YOLO นับมือเป็นคน
+#  IoU และ Box Filtering
 # ─────────────────────────────────────────────────────
 
 def compute_iou(boxA, boxB) -> float:
-    """
-    คำนวณ Intersection over Union (IoU) ของ 2 Bounding Box
-
-    Parameters:
-        boxA, boxB: array-like [x1, y1, x2, y2]
-
-    Returns:
-        float: ค่า IoU (0.0 – 1.0)
-    """
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-
-    inter = max(0, xB - xA) * max(0, yB - yA)
+    """IoU ของ 2 Bounding Box [x1, y1, x2, y2]"""
+    xA = max(boxA[0], boxB[0]);  yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2]);  yB = min(boxA[3], boxB[3])
+    inter = max(0, xB-xA) * max(0, yB-yA)
     if inter == 0:
         return 0.0
-
-    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-    return inter / (areaA + areaB - inter)
+    aA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
+    aB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
+    return inter / (aA + aB - inter)
 
 
 def filter_duplicate_boxes(boxes: list, ids: list,
                             iou_threshold: float = 0.4) -> tuple:
     """
-    กรอง Bounding Box ที่ซ้อนทับกันเกิน iou_threshold ออก
-    เก็บเฉพาะ Box ที่ใหญ่กว่า (= ตัวจริง ไม่ใช่มือ/แขนที่ลอยอยู่)
-
-    Parameters:
-        boxes         : list ของ [x1, y1, x2, y2]
-        ids           : list ของ Player ID (ตำแหน่งตรงกับ boxes)
-        iou_threshold : ค่า IoU ที่เกินแล้วถือว่า "ซ้อนกัน" (default 0.4)
-
-    Returns:
-        (filtered_boxes, filtered_ids)
+    กรอง Box ซ้อนทับกัน เก็บ Box ใหญ่ไว้ (ตัวจริง)
+    ตัด Box เล็กที่ซ้อนอยู่ทิ้ง (มือ/แขนลอย)
     """
     if len(boxes) == 0:
         return boxes, ids
 
-    # เรียงลำดับจาก Box ใหญ่ → เล็ก (ตาม Area)
-    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in boxes]
+    areas = [(b[2]-b[0])*(b[3]-b[1]) for b in boxes]
     order = sorted(range(len(areas)), key=lambda i: areas[i], reverse=True)
-
-    keep       = []
-    suppressed = set()
+    keep = [];  suppressed = set()
 
     for i in order:
         if i in suppressed:
             continue
         keep.append(i)
-        # Box เล็กกว่าที่ซ้อนทับเกิน Threshold → ตัดทิ้ง
         for j in order:
             if j == i or j in suppressed:
                 continue
             if compute_iou(boxes[i], boxes[j]) > iou_threshold:
                 suppressed.add(j)
+
+    return [boxes[i] for i in keep], [ids[i] for i in keep]
+
+
+def filter_mirror_boxes(boxes: list, ids: list,
+                        frame_w: int,
+                        size_ratio_thresh: float = 0.55,
+                        brightness_thresh: float = 30.0,
+                        frame_bgr=None) -> tuple:
+    """
+    กรองเงาในกระจก/ภาพสะท้อนออกจาก Person Detection
+
+    หลักการ 3 ชั้น:
+        1. Size Ratio  — เงาในกระจกมักมีขนาดเล็กกว่าตัวจริงมาก
+                         Box ที่มี Area < size_ratio_thresh × Area ใหญ่สุด → ตัดทิ้ง
+                         (ใช้ได้ดีเมื่อกระจกอยู่ข้าง/หลัง)
+
+        2. Edge Bias   — กระจกมักอยู่ขอบซ้าย/ขวา
+                         Box ที่ center_x อยู่ใน 15% ขอบซ้ายขวา
+                         และมีขนาดเล็กกว่า 40% ของ Box ใหญ่สุด → ตัดทิ้ง
+
+        3. Brightness  — เงาในกระจกมักมืดกว่าหรือ contrast ต่างกัน
+                         (เฉพาะเมื่อส่ง frame_bgr มาด้วย)
+
+    Parameters:
+        boxes            : list ของ [x1,y1,x2,y2]
+        ids              : list ของ Player ID
+        frame_w          : ความกว้างของเฟรม (pixel)
+        size_ratio_thresh: Box ที่เล็กกว่า ratio นี้ × Box ใหญ่สุด → ตัดทิ้ง
+        brightness_thresh: ค่าต่างสว่าง (Mean BGR) ที่ถือว่า "ต่างกันมาก"
+        frame_bgr        : numpy array ของ frame ต้นฉบับ (optional)
+
+    Returns:
+        (filtered_boxes, filtered_ids)
+    """
+    if len(boxes) <= 1:
+        return boxes, ids  # คนเดียวไม่มีเงา
+
+    areas    = [(b[2]-b[0])*(b[3]-b[1]) for b in boxes]
+    max_area = max(areas)
+    keep     = []
+
+    for i, (box, area) in enumerate(zip(boxes, areas)):
+        cx = (box[0] + box[2]) / 2  # Center X ของ Box
+
+        # ── ชั้น 1: Size Ratio ──────────────────────────
+        if max_area > 0 and (area / max_area) < size_ratio_thresh:
+            # Box เล็กกว่า 55% ของ Box ใหญ่สุด → น่าจะเป็นเงา
+            continue
+
+        # ── ชั้น 2: Edge Bias ────────────────────────────
+        edge_zone = frame_w * 0.15  # 15% ขอบซ้ายขวา
+        is_edge   = (cx < edge_zone) or (cx > frame_w - edge_zone)
+        is_small  = (area / max_area) < 0.40
+
+        if is_edge and is_small:
+            # อยู่ขอบและเล็กกว่า 40% → น่าจะเป็นเงาในกระจกข้างห้อง
+            continue
+
+        # ── ชั้น 3: Brightness (optional) ────────────────
+        if frame_bgr is not None and brightness_thresh > 0:
+            x1, y1, x2, y2 = map(int, box)
+            x1 = max(0, x1);  y1 = max(0, y1)
+            x2 = min(frame_bgr.shape[1], x2)
+            y2 = min(frame_bgr.shape[0], y2)
+            roi = frame_bgr[y1:y2, x1:x2]
+
+            if roi.size > 0:
+                # เปรียบสว่างเฉลี่ยกับ Box ที่ใหญ่ที่สุด
+                big_idx = areas.index(max_area)
+                bx1, by1, bx2, by2 = map(int, boxes[big_idx])
+                bx1 = max(0, bx1);  by1 = max(0, by1)
+                bx2 = min(frame_bgr.shape[1], bx2)
+                by2 = min(frame_bgr.shape[0], by2)
+                big_roi = frame_bgr[by1:by2, bx1:bx2]
+
+                if big_roi.size > 0 and i != big_idx:
+                    bright_diff = abs(float(roi.mean()) -
+                                      float(big_roi.mean()))
+                    if bright_diff > brightness_thresh and is_small:
+                        continue  # สว่างต่างกันมากและเล็กกว่า → เงา
+
+        keep.append(i)
+
+    if len(keep) == 0:
+        # ถ้ากรองหมดให้เก็บ Box ใหญ่สุดไว้
+        keep = [areas.index(max_area)]
 
     return [boxes[i] for i in keep], [ids[i] for i in keep]
 
@@ -124,35 +175,23 @@ def filter_duplicate_boxes(boxes: list, ids: list,
 
 class PlayerStabilityFilter:
     """
-    กรอง Player ID ที่ "กระพริบ" (ปรากฏแล้วหายเร็วมาก)
-
-    หลักการ:
-        - ID จริง (คนจริง)   → ปรากฏต่อเนื่องหลายเฟรม
-        - ID Noise (มือ/แขน) → ปรากฏแค่ 1–5 เฟรมแล้วหาย
-
-    Attributes:
-        MIN_FRAMES    : ต้องเห็น ID ต่อเนื่องกี่เฟรมถึง "ยืนยัน"
-        EXPIRE_FRAMES : ไม่เห็น ID กี่เฟรมถึงถือว่าออกไปแล้ว
+    กรอง Player ID ที่ปรากฏแล้วหายเร็ว (Noise)
+    ID จริงปรากฏต่อเนื่อง ≥ MIN_FRAMES จึง Accept
     """
 
-    MIN_FRAMES    = 8   # เฟรมขั้นต่ำก่อน Accept
-    EXPIRE_FRAMES = 30  # เฟรมที่ไม่เห็นแล้วถือว่าออกไป
+    MIN_FRAMES    = 8    # เฟรมขั้นต่ำก่อน Accept
+    EXPIRE_FRAMES = 30   # ไม่เห็นกี่เฟรมถึงถือว่าออกไป
 
     def __init__(self):
-        self._seen      : dict = {}   # {id: จำนวนเฟรมที่เห็น}
-        self._last_seen : dict = {}   # {id: เฟรมล่าสุดที่เห็น}
-        self._active    : set  = set() # ID ที่ผ่านการยืนยัน
+        self._seen      : dict = {}
+        self._last_seen : dict = {}
+        self._active    : set  = set()
         self._frame     : int  = 0
 
     def update(self, current_ids: list) -> set:
         """
-        อัปเดต Filter ด้วย ID ที่เห็นในเฟรมนี้
-
-        Parameters:
-            current_ids: list ของ ID ที่ YOLO ตรวจพบในเฟรมนี้
-
-        Returns:
-            set ของ ID ที่ "ผ่านการยืนยัน" และอยู่ใน current_ids ด้วย
+        อัปเดตด้วย ID ที่เห็นในเฟรมนี้
+        Returns: set ของ ID ที่ "ยืนยันแล้ว" และอยู่ใน current_ids
         """
         self._frame += 1
 
@@ -162,7 +201,6 @@ class PlayerStabilityFilter:
             if self._seen[pid] >= self.MIN_FRAMES:
                 self._active.add(pid)
 
-        # ลบ ID ที่หายไปนานเกิน EXPIRE_FRAMES
         stale = [pid for pid, last in self._last_seen.items()
                  if self._frame - last > self.EXPIRE_FRAMES]
         for pid in stale:
@@ -170,22 +208,20 @@ class PlayerStabilityFilter:
             self._seen.pop(pid, None)
             self._last_seen.pop(pid, None)
 
-        # Return เฉพาะ ID ที่ยืนยันแล้ว AND เห็นอยู่ในเฟรมนี้
         return self._active & set(current_ids)
 
 
 # ─────────────────────────────────────────────────────
-#  FoulLogger — บันทึกเหตุการณ์ฟาวล์ลง CSV
+#  FoulLogger — บันทึก CSV
 # ─────────────────────────────────────────────────────
 
 class FoulLogger:
     """
-    บันทึกการตรวจจับฟาวล์ลงไฟล์ CSV พร้อมระบบ Cooldown
-    เพื่อป้องกันการบันทึกซ้ำในเฟรมที่ติดกัน
+    บันทึกฟาวล์ลง CSV พร้อม Cooldown ป้องกัน Log ซ้ำรัวๆ
 
     Usage:
         logger = FoulLogger("logs.csv", cooldown_sec=3.0)
-        logger.log_foul(player_id=1, foul_type="TRAVELING")
+        logger.log_foul(1, "TRAVELING")
     """
 
     CSV_HEADERS = ["Date_Time", "Player_ID", "Foul_Type"]
@@ -194,103 +230,86 @@ class FoulLogger:
                  cooldown_sec: float = 3.0):
         self.filename     = filename
         self.cooldown_sec = cooldown_sec
-        self._last_logged : dict = {}  # key = "playerID_foulType"
+        self._last_logged : dict = {}
 
-        # สร้างไฟล์ใหม่พร้อม Header ถ้ายังไม่มี
         if not os.path.exists(self.filename):
             self._write_row(self.CSV_HEADERS, mode='w')
 
     def log_foul(self, player_id: int, foul_type: str) -> bool:
-        """
-        บันทึกฟาวล์ถ้าพ้น Cooldown แล้ว
-
-        Returns:
-            bool: True = บันทึกสำเร็จ, False = ยังอยู่ใน Cooldown
-        """
+        """บันทึกถ้าพ้น Cooldown"""
         now = time.time()
-        key = f"{player_id}_{foul_type}"
+        # ใช้ foul type ไม่เกิน 20 ตัวอักษรแรกเป็น key
+        # กันกรณี velocity ต่างกันทุกเฟรมทำให้ key ต่างกันทุกเฟรม
+        foul_key = foul_type[:20].strip()
+        key = f"{player_id}_{foul_key}"
 
-        if key in self._last_logged and (now - self._last_logged[key]) < self.cooldown_sec:
+        if (key in self._last_logged and
+                (now - self._last_logged[key]) < self.cooldown_sec):
             return False
 
         self._last_logged[key] = now
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
-        self._write_row([timestamp, f"Player_{player_id}", foul_type])
-        print(f"📝 [LOG] {timestamp} | Player {player_id} | {foul_type}")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        self._write_row([ts, f"Player_{player_id}", foul_type])
+        print(f"📝 [LOG] {ts} | Player {player_id} | {foul_type}")
         return True
 
     def _write_row(self, row: list, mode: str = 'a'):
-        """เขียน 1 แถวลงไฟล์ CSV"""
         with open(self.filename, mode=mode, newline='', encoding='utf-8') as f:
             csv.writer(f).writerow(row)
 
 
 # ─────────────────────────────────────────────────────
-#  AccuracyTracker — ติดตามและรายงานความแม่นยำ
+#  AccuracyTracker — รายงานความแม่นยำ
 # ─────────────────────────────────────────────────────
 
 class AccuracyTracker:
     """
-    ติดตามสถิติการตรวจจับของแต่ละประเภทฟาวล์
-    และพิมพ์รายงานสรุปเมื่อจบ Session
-
-    Usage:
-        tracker = AccuracyTracker()
-        tracker.record("TRAVELING", detected=True)
-        tracker.tick_frame()
-        tracker.print_report()
+    ติดตาม Activation Rate ของแต่ละ Rule
+    พิมพ์รายงานสรุปเมื่อ Session จบ
     """
 
     def __init__(self):
         self._stats : dict = defaultdict(
-            lambda: {"total": 0, "detected": 0, "consecutive": 0, "max_consecutive": 0}
+            lambda: {"total": 0, "detected": 0,
+                     "consecutive": 0, "max_consecutive": 0}
         )
         self._session_start = time.time()
         self._total_frames  = 0
 
     def record(self, foul_type: str, detected: bool):
-        """
-        บันทึกผลการตรวจ 1 เฟรมสำหรับ foul_type ที่ระบุ
-
-        Parameters:
-            foul_type : ชื่อฟาวล์ เช่น "TRAVELING"
-            detected  : True = ตรวจพบในเฟรมนี้
-        """
         s = self._stats[foul_type]
         s["total"] += 1
         if detected:
             s["detected"]        += 1
             s["consecutive"]     += 1
-            s["max_consecutive"]  = max(s["max_consecutive"], s["consecutive"])
+            s["max_consecutive"]  = max(s["max_consecutive"],
+                                        s["consecutive"])
         else:
             s["consecutive"] = 0
 
     def tick_frame(self):
-        """เรียกทุกเฟรมหลัก เพื่อนับ FPS และความยาว Session"""
         self._total_frames += 1
 
     def print_report(self):
-        """พิมพ์รายงานสรุปสถิติเมื่อจบ Session"""
         elapsed = time.time() - self._session_start
         fps     = self._total_frames / elapsed if elapsed > 0 else 0
 
-        print("\n" + "═" * 60)
+        print("\n" + "═"*60)
         print("  📊  AI BASKETBALL REFEREE — SESSION REPORT")
-        print("═" * 60)
-        print(f"  Duration : {elapsed:.1f} sec  "
+        print("═"*60)
+        print(f"  Duration : {elapsed:.1f}s  "
               f"({self._total_frames} frames @ {fps:.1f} FPS)")
-        print(f"  Rules Monitored: {len(self._stats)}")
-        print("─" * 60)
-        print(f"  {'Rule':<22} {'Checks':>7} {'Detections':>11} "
+        print("─"*60)
+        print(f"  {'Rule':<22} {'Checks':>7} {'Hits':>7} "
               f"{'Rate':>7} {'MaxStreak':>10}")
-        print("─" * 60)
+        print("─"*60)
 
         for foul_type, s in sorted(self._stats.items()):
             total  = s["total"]
             det    = s["detected"]
-            rate   = (det / total * 100) if total > 0 else 0.0
+            rate   = (det/total*100) if total > 0 else 0.0
             streak = s["max_consecutive"]
-            print(f"  {foul_type:<22} {total:>7} {det:>11} "
+            print(f"  {foul_type:<22} {total:>7} {det:>7} "
                   f"{rate:>6.1f}%  {streak:>9}")
 
-        print("═" * 60 + "\n")
+        print("═"*60 + "\n")

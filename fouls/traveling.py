@@ -1,118 +1,119 @@
 """
-fouls/traveling.py — ตรวจจับ Traveling (ก้าวเท้าเกิน 2 ก้าว ขณะถือบอล)
+fouls/traveling.py — ตรวจจับ Traveling (ก้าวเกิน 2 ก้าว & Up-and-Down)
 -------------------------------------------------------------------------
-ปัญหาของเวอร์ชันเดิม:
-  1. บวก 0.1 ต่อเฟรม → ขึ้นอยู่กับ FPS ทำให้ผลต่างกันในแต่ละเครื่อง
-  2. ไม่มี Debounce → นับซ้ำถ้าเท้าสั่น (Jitter) เล็กน้อย
-  3. ไม่ Reset เมื่อหยุดถือบอล
-
-การแก้ไข:
-  - ใช้ Peak Detection (จาก Low → High) แทนการนับต่อเฟรม
-    → นับ "ก้าวจริง" โดยดูว่าเท้าข้างไหน Y ขึ้นสูงสุดแล้วลงมา
-  - เพิ่ม Smoothing ด้วย Rolling Average เพื่อกรอง Noise
-  - Reset steps เมื่อปล่อยบอล
+การปรับปรุงล่าสุด:
+  - (เดิม) นับก้าวจริงด้วย Peak Detection + Smoothing 
+  - (ใหม่) เพิ่มระบบตรวจจับ "Up-and-Down" (กระโดดแล้วไม่ปล่อยบอลก่อนเท้าแตะพื้น)
 """
 
 from collections import deque
 
-
 class TravelingDetector:
     """
-    ตรวจจับ Traveling โดยนับ "จำนวนก้าวจริง" ด้วย Peak Detection
-
-    Logic:
-        1. เก็บประวัติค่า Y ของข้อเท้าซ้าย/ขวา (Smoothed)
-        2. ก้าว = เมื่อ Y ของเท้าข้างใดข้างหนึ่งเปลี่ยนทิศ (Peak/Valley)
-        3. ถ้าก้าวเกิน MAX_STEPS ขณะถือบอล → TRAVELING
+    ตรวจจับ Traveling 2 รูปแบบหลัก:
+        1. Too Many Steps : ก้าวเกิน MAX_STEPS ขณะถือบอล
+        2. Up-and-Down    : กระโดดขณะถือบอล แล้วลงพื้นโดยยังไม่ปล่อยบอล
     """
 
+    # ── Config การนับก้าว ──
     MAX_STEPS   = 2      # จำนวนก้าวสูงสุดที่อนุญาต
     SMOOTH_WIN  = 5      # ขนาดหน้าต่าง Smoothing (เฟรม)
     STEP_THRESH = 12     # ระยะ Y ขั้นต่ำ (px) ที่ถือว่าเป็น "ก้าว"
 
+    # ── Config การกระโดด (Up-and-Down) ──
+    JUMP_THRESH = 40     # ระยะพิกัด Y ที่ลอยขึ้นไปแล้วถือว่า "กระโดดพ้นพื้น"
+
     def __init__(self):
-        # ประวัติ Y สำหรับ Smoothing
+        # ── State สำหรับนับก้าว ──
         self._l_hist: deque = deque(maxlen=self.SMOOTH_WIN)
         self._r_hist: deque = deque(maxlen=self.SMOOTH_WIN)
-
         self.steps = 0
         self._prev_l_smooth = None
         self._prev_r_smooth = None
         self._l_direction   = 0   # +1 = กำลังยก, -1 = กำลังวาง
         self._r_direction   = 0
 
-        self._was_holding = False  # สถานะการถือบอลเฟรมก่อน
+        # ── State สำหรับ Up-and-Down ──
+        self._was_holding      = False
+        self._jumped_with_ball = False
+        self._ground_l_y       = 0.0  # เก็บ Baseline พื้นของเท้าซ้าย
+        self._ground_r_y       = 0.0  # เก็บ Baseline พื้นของเท้าขวา
 
     # ─── Public API ───────────────────────────────────
 
-    def check(self, landmarks_px: dict, mp_pose, is_holding: bool):
+    def check(self, landmarks_px: dict, mp_pose, is_holding: bool) -> tuple:
         """
         ตรวจสอบ Traveling ใน 1 เฟรม
-
-        Parameters:
-            landmarks_px : dict {landmark_id: (x, y)}
-            mp_pose      : mediapipe.solutions.pose module
-            is_holding   : bool — ผู้เล่นถือบอลอยู่หรือไม่
-
-        Returns:
-            (is_violation: bool, message: str)
+        Returns: (is_violation: bool, message: str)
         """
-        # ดึงพิกัด Y ของข้อเท้า
+        # ดึงพิกัด Y ของข้อเท้า (Y ยิ่งมาก = ยิ่งอยู่ต่ำ/ติดพื้น)
         l_y = landmarks_px[mp_pose.PoseLandmark.LEFT_ANKLE][1]
         r_y = landmarks_px[mp_pose.PoseLandmark.RIGHT_ANKLE][1]
 
-        # ── รีเซ็ตเมื่อเพิ่งเริ่มถือบอล (Gather Step = 0) ──
+        # ── 1. จัดการจังหวะเริ่มถือบอล (Gather Step) ──
         if is_holding and not self._was_holding:
-            self._reset_steps()
+            self._reset_states(l_y, r_y)
+
+        # ถ้าปล่อยบอลไปแล้ว (Pass/Shoot) รีเซ็ตสถานะการกระโดด
+        if not is_holding:
+            self._jumped_with_ball = False
+            self._was_holding = False
+            return False, f"Steps: {self.steps}"
 
         self._was_holding = is_holding
 
-        if not is_holding:
-            return False, f"Steps: {self.steps}"
+        # ── 2. อัปเดต Baseline พื้น (Ground Level) ──
+        # คอยอัปเดตค่า Y ที่ต่ำที่สุด (ค่ามากสุดในแกน Y) ไว้เป็น "พื้น" เสมอ
+        self._ground_l_y = max(self._ground_l_y, l_y)
+        self._ground_r_y = max(self._ground_r_y, r_y)
 
-        # ── Smoothing: เฉลี่ย Y ใน Rolling Window ──
+        # ── 3. ตรวจสอบ "Up-and-Down" (กระโดดแล้วไม่ปล่อยบอล) ──
+        # ตรวจว่าเท้าทั้งสองลอยพ้นพื้น (ค่า Y ลดลงเกิน Threshold)
+        is_airborne = (self._ground_l_y - l_y > self.JUMP_THRESH) and \
+                      (self._ground_r_y - r_y > self.JUMP_THRESH)
+
+        if is_airborne:
+            self._jumped_with_ball = True
+
+        # ตรวจการลงพื้น: เท้าข้างใดข้างหนึ่งกลับมาใกล้ระดับพื้น
+        is_landed = (self._ground_l_y - l_y < self.JUMP_THRESH * 0.3) or \
+                    (self._ground_r_y - r_y < self.JUMP_THRESH * 0.3)
+
+        if self._jumped_with_ball and is_landed:
+            return True, "TRAVELING (Up & Down)"
+
+        # ── 4. ตรวจสอบ "จำนวนก้าว" (Too Many Steps) ──
         self._l_hist.append(l_y)
         self._r_hist.append(r_y)
 
-        if len(self._l_hist) < self.SMOOTH_WIN:
-            return False, f"Steps: {self.steps}"  # รอข้อมูลพอสำหรับ Smooth
+        if len(self._l_hist) == self.SMOOTH_WIN:
+            l_smooth = sum(self._l_hist) / self.SMOOTH_WIN
+            r_smooth = sum(self._r_hist) / self.SMOOTH_WIN
 
-        l_smooth = sum(self._l_hist) / len(self._l_hist)
-        r_smooth = sum(self._r_hist) / len(self._r_hist)
+            if self._prev_l_smooth is not None:
+                self.steps += self._count_step(self._prev_l_smooth, l_smooth, "_l_direction")
+                self.steps += self._count_step(self._prev_r_smooth, r_smooth, "_r_direction")
 
-        # ── Peak Detection: นับก้าวเมื่อทิศทาง Y กลับทาง ──
-        if self._prev_l_smooth is not None:
-            self.steps += self._count_step(self._prev_l_smooth, l_smooth,
-                                            "_l_direction")
-            self.steps += self._count_step(self._prev_r_smooth, r_smooth,
-                                            "_r_direction")
+            self._prev_l_smooth = l_smooth
+            self._prev_r_smooth = r_smooth
 
-        self._prev_l_smooth = l_smooth
-        self._prev_r_smooth = r_smooth
-
-        # ── ตัดสิน ──
-        if self.steps > self.MAX_STEPS:
-            return True, f"TRAVELING ({self.steps} steps)"
+            if self.steps > self.MAX_STEPS:
+                return True, f"TRAVELING ({self.steps} steps)"
 
         return False, f"Steps: {self.steps}"
 
     # ─── Private Helpers ──────────────────────────────
 
-    def _count_step(self, prev_y: float, curr_y: float,
-                    direction_attr: str) -> int:
-        """
-        นับ 1 ก้าวเมื่อ Y เปลี่ยนทิศจาก "ลง" → "ขึ้น"
-        (เท้าวางลงดิน แล้วยกขึ้นมา = 1 ก้าว)
-        """
-        diff = curr_y - prev_y  # บวก = ลงต่ำ, ลบ = ยกขึ้น
+    def _count_step(self, prev_y: float, curr_y: float, direction_attr: str) -> int:
+        """นับ 1 ก้าวเมื่อ Y เปลี่ยนทิศจาก "ลง" → "ขึ้น" """
+        diff = curr_y - prev_y
         current_dir = getattr(self, direction_attr)
 
         if abs(diff) < self.STEP_THRESH:
-            return 0  # เคลื่อนที่น้อยเกิน → ไม่นับ (กรอง Jitter)
+            return 0  
 
         new_dir = 1 if diff > 0 else -1
 
-        # ทิศกลับจาก "ลง" (1) → "ขึ้น" (-1) = เท้ายกขึ้น = ก้าวใหม่
         if current_dir == 1 and new_dir == -1:
             setattr(self, direction_attr, new_dir)
             return 1
@@ -120,8 +121,8 @@ class TravelingDetector:
         setattr(self, direction_attr, new_dir)
         return 0
 
-    def _reset_steps(self):
-        """รีเซ็ตตัวนับก้าวและ Direction State"""
+    def _reset_states(self, l_y: float, r_y: float):
+        """รีเซ็ตตัวนับก้าว, สถานะการกระโดด และระดับพื้น เมื่อเริ่มถือบอลใหม่"""
         self.steps = 0
         self._l_direction = 0
         self._r_direction = 0
@@ -129,3 +130,7 @@ class TravelingDetector:
         self._prev_r_smooth = None
         self._l_hist.clear()
         self._r_hist.clear()
+        
+        self._jumped_with_ball = False
+        self._ground_l_y = l_y
+        self._ground_r_y = r_y
