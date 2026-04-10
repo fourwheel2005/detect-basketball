@@ -96,114 +96,50 @@ class BasketballRef:
 
     # ─── Public API ───────────────────────────────────
 
-    def process(self, player_id: int, landmarks_px: dict,
-                mp_pose, ball_box, frame_w: int, frame_h: int,
-                roi_bgr=None) -> tuple:
-        """
-        ประมวลผลผู้เล่น 1 คน ใน 1 เฟรม
+   # ไฟล์ referee.py (ตัดมาเฉพาะส่วนฟังก์ชัน process เพื่ออัปเดต)
+    def process(self, p_id, landmarks_px, mp_pose, ball_box, frame_w, frame_h):
+        detectors = self.get_detectors(p_id)
+        violations = []
+        info_texts = []
 
-        Parameters:
-            player_id   : int   — TrackID จาก YOLO
-            landmarks_px: dict  — {landmark_id (int): (x, y)} Global Pixel
-            mp_pose     : mediapipe.solutions.pose
-            ball_box    : array [x1, y1, x2, y2] หรือ None
-            frame_w/h   : ขนาดเฟรม (pixel)
-            roi_bgr     : numpy array BGR ของผู้เล่น (สำหรับ 3D CNN)
-                          ถ้าไม่ส่งมา Rule 6 จะถูกข้าม
+        # 📌 1. Dynamic Scale: หาความกว้างไหล่ (Shoulder Width) เพื่อใช้เป็นเกณฑ์วัด
+        l_shoulder = landmarks_px[mp_pose.PoseLandmark.LEFT_SHOULDER]
+        r_shoulder = landmarks_px[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        from utils import get_dist, is_point_near_box
+        shoulder_width = get_dist(l_shoulder, r_shoulder)
+        if shoulder_width < 10: shoulder_width = 10 # ป้องกันค่า 0
 
-        Returns:
-            violations (list[str]) : รายชื่อฟาวล์ที่พบ
-            info_texts (list[str]) : ข้อมูล Debug / สถานะ
-        """
-        # ── ด่าน 1: ตรวจสอบ Pose ก่อนทำอะไรทั้งหมด ──
-        is_valid, reason = _is_pose_valid(landmarks_px, mp_pose)
-        if not is_valid:
-            return [], [f"[SKIP] {reason}"]
-
-        # บันทึก landmarks ล่าสุดของผู้เล่นคนนี้
-        # (ใช้โดย _find_nearest_opponent สำหรับ Jump Ball)
-        self._latest_landmarks[player_id] = landmarks_px
-
-        detectors  = self._get_detectors(player_id)
-        violations : list = []
-        info_texts : list = []
-
-        # ── คำนวณ Ball Center จาก Bounding Box ──
+        # 📌 2. Dynamic Possession: เช็คการครองบอลจาก Bounding Box และปลายนิ้ว
+        is_holding = False
         ball_center = None
         if ball_box is not None:
             bx1, by1, bx2, by2 = ball_box
-            ball_center = ((bx1 + bx2) / 2, (by1 + by2) / 2)
+            ball_center = ((bx1+bx2)/2, (by1+by2)/2)
+            
+            r_index = landmarks_px[mp_pose.PoseLandmark.RIGHT_INDEX]
+            l_index = landmarks_px[mp_pose.PoseLandmark.LEFT_INDEX]
+            
+            # Margin แปรผันตามขนาดตัว (ไหล่)
+            margin = int(shoulder_width * 0.2) 
+            
+            if is_point_near_box(r_index[0], r_index[1], ball_box, margin) or \
+               is_point_near_box(l_index[0], l_index[1], ball_box, margin):
+                is_holding = True
 
-        # ── ตรวจสอบว่าผู้เล่นถือบอลอยู่หรือไม่ ──
-        is_holding = self._check_holding(landmarks_px, mp_pose, ball_center)
+        # --- Check Rules ---
+        
+        # Double Dribble
+        is_dd, msg_dd = detectors["dd"].check(landmarks_px, mp_pose, ball_center)
+        if is_dd: violations.append(msg_dd)
 
-        # ════════════════════════════════════════════
-        #  Rule 1: Double Dribble
-        # ════════════════════════════════════════════
-        is_dd, msg_dd = detectors["dd"].check(
-            landmarks_px, mp_pose, ball_center)
-        self.accuracy.record("DOUBLE_DRIBBLE", is_dd)
-        if is_dd:
-            violations.append(msg_dd)
+        # 📌 3. Traveling (ส่ง shoulder_width ไปคำนวณ Dynamic Threshold ด้วย)
+        is_tr, msg_tr = detectors["tr"].check(landmarks_px, mp_pose, is_holding, shoulder_width)
+        if is_tr: violations.append(msg_tr)
+        elif "Steps" in msg_tr: info_texts.append(msg_tr)
 
-        # ════════════════════════════════════════════
-        #  Rule 2: Traveling
-        # ════════════════════════════════════════════
-        is_tr, msg_tr = detectors["tr"].check(
-            landmarks_px, mp_pose, is_holding)
-        self.accuracy.record("TRAVELING", is_tr)
-        if is_tr:
-            violations.append(msg_tr)
-        elif msg_tr.startswith("Steps"):
-            info_texts.append(msg_tr)
-
-        # ════════════════════════════════════════════
-        #  Rule 3: Carrying
-        # ════════════════════════════════════════════
-        is_ca, msg_ca = detectors["ca"].check(
-            landmarks_px, mp_pose, is_holding)
-        self.accuracy.record("CARRYING", is_ca)
-        if is_ca:
-            violations.append(msg_ca)
-
-        # ════════════════════════════════════════════
-        #  Rule 4: Goaltending
-        # ════════════════════════════════════════════
-        is_gt, msg_gt = detectors["gt"].check(ball_center, frame_h)
-        self.accuracy.record("GOALTENDING", is_gt and is_holding)
-        if is_gt and is_holding:
-            violations.append(msg_gt)
-
-        # ════════════════════════════════════════════
-        #  Rule 5: Jump Ball Foul
-        # ════════════════════════════════════════════
-        #opponent_lm = self._find_nearest_opponent(player_id, landmarks_px)
-        #is_jb, msg_jb = detectors["jb"].check(
-         #   landmarks_px, mp_pose, opponent_lm)
-       # self.accuracy.record("JUMP_BALL_FOUL", is_jb)
-       # if is_jb:
-        #    violations.append(msg_jb)
-        #elif "Phase" in msg_jb:
-         #   info_texts.append(msg_jb)
-
-        # ════════════════════════════════════════════
-        #  Rule 6: Contact Foul (3D CNN)
-        #  ทำงานเฉพาะเมื่อ:
-        #    - CONTACT_FOUL_AVAILABLE = True (โหลด model สำเร็จ)
-        #    - roi_bgr ถูกส่งมาจาก main.py
-        # ════════════════════════════════════════════
-        if CONTACT_FOUL_AVAILABLE and roi_bgr is not None:
-            is_cf, msg_cf = detectors["cf"].check(roi_bgr)
-            self.accuracy.record("CONTACT_FOUL", is_cf)
-            if is_cf:
-                violations.append(msg_cf)
-        else:
-            # ยังไม่มี model → ข้ามเงียบๆ ไม่แจ้งเตือนทุกเฟรม
-            self.accuracy.record("CONTACT_FOUL", False)
-
-        # แสดงสถานะ Holding เป็น Info
-        if is_holding:
-            info_texts.append("Holding Ball")
+        # Carrying
+        is_ca, msg_ca = detectors["ca"].check(landmarks_px, mp_pose, is_holding)
+        if is_ca: violations.append(msg_ca)
 
         return violations, info_texts
 

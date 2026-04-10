@@ -257,6 +257,39 @@ class FoulLogger:
         with open(self.filename, mode=mode, newline='', encoding='utf-8') as f:
             csv.writer(f).writerow(row)
 
+def is_point_near_box(px, py, box, margin=10):
+    bx1, by1, bx2, by2 = box
+    return (bx1 - margin <= px <= bx2 + margin) and (by1 - margin <= py <= by2 + margin)
+
+
+#มีการใช้สูตรคณิตศาสตร์ในการคำนวณ
+class EMAFilter:
+    """ลดการสั่น (Jitter) ของพิกัดด้วย Exponential Moving Average"""
+    def __init__(self, alpha=0.3):
+        self.alpha = alpha
+        self.val = None
+
+    def update(self, new_val):
+        if self.val is None:
+            self.val = new_val
+        else:
+            self.val = self.alpha * new_val + (1 - self.alpha) * self.val
+        return self.val
+
+from collections import deque
+
+class TemporalVoter:
+    """ระบบ Voting ป้องกันการตัดสินพลาดชั่วขณะ (False Positive)"""
+    def __init__(self, window_size=5, threshold=3):
+        self.history = deque(maxlen=window_size)
+        self.threshold = threshold
+
+    def vote(self, detection_result):
+        # detection_result เป็น True/False
+        self.history.append(1 if detection_result else 0)
+        # ถ้าผลรวมคะแนนโหวต >= เกณฑ์ที่ตั้งไว้ ถือว่าเกิดขึ้นจริง
+        return sum(self.history) >= self.threshold
+
 
 # ─────────────────────────────────────────────────────
 #  AccuracyTracker — รายงานความแม่นยำ
@@ -313,3 +346,6 @@ class AccuracyTracker:
                   f"{rate:>6.1f}%  {streak:>9}")
 
         print("═"*60 + "\n")
+
+
+        
