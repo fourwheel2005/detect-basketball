@@ -11,18 +11,26 @@ R = cv_file.getNode("R").mat()
 T = cv_file.getNode("T").mat()
 cv_file.release()
 
+# โหลด dist ด้วย
+dist_mac    = cv_file.getNode("dist_mac").mat()
+dist_iphone = cv_file.getNode("dist_iphone").mat()
+cv_file.release()
+
 # สร้าง Projection Matrix (สมการยิงแสงจากกล้อง)
 P1 = np.dot(mtx_mac, np.hstack((np.eye(3), np.zeros((3, 1)))))
 P2 = np.dot(mtx_iphone, np.hstack((R, T)))
 
+# ฟังก์ชันใหม่ — undistort ก่อน triangulate
 def get_3d_coordinate(pt_mac, pt_iphone):
-    """แปลงพิกัด 2D จากสองกล้อง ให้เป็นพิกัด 3D โลกจริง"""
-    pt1 = np.array([[pt_mac[0]], [pt_mac[1]]], dtype=np.float32)
-    pt2 = np.array([[pt_iphone[0]], [pt_iphone[1]]], dtype=np.float32)
-    
-    # คณิตศาสตร์ Triangulation (ยิงเส้นตรง 2 เส้นไปตัดกัน)
-    pt_4d = cv2.triangulatePoints(P1, P2, pt1, pt2)
-    pt_3d = pt_4d[:3] / pt_4d[3] # ปรับให้เป็นพิกัด 3D ปกติ
+    pt1 = np.array([[[pt_mac[0], pt_mac[1]]]], dtype=np.float32)
+    pt2 = np.array([[[pt_iphone[0], pt_iphone[1]]]], dtype=np.float32)
+
+    # ← ขั้นตอนสำคัญที่หายไป
+    pt1_ud = cv2.undistortPoints(pt1, mtx_mac, dist_mac, P=mtx_mac)
+    pt2_ud = cv2.undistortPoints(pt2, mtx_iphone, dist_iphone, P=mtx_iphone)
+
+    pt_4d = cv2.triangulatePoints(P1, P2, pt1_ud[0][0], pt2_ud[0][0])
+    pt_3d = pt_4d[:3] / pt_4d[3]
     return pt_3d.flatten()
 
 # 2. ตั้งค่า MediaPipe (ตรวจจับมือ)
