@@ -1,46 +1,19 @@
-"""
-fouls/goaltending.py — ตรวจจับ Goaltending (บล็อคบอลขณะตกลง)
---------------------------------------------------------------
-ปัญหาเวอร์ชันเดิม:
-    - เช็คแค่ว่าบอลกำลัง "ตก" + อยู่สูงพอ
-    - ไม่ได้เช็คว่า "ผู้เล่นแตะบอล" ด้วย → False Positive สูง
-
-การปรับปรุง:
-    - ใช้ Parabolic Trajectory Fitting (3 จุด) เพื่อยืนยันว่า
-      บอลอยู่บน Downward Arc จริงๆ
-    - รวม Condition: บอลตก + สูงพอ + ผู้เล่นใกล้บอล → แจ้งเตือน
-"""
-
-from collections import deque
 import numpy as np
-
+from collections import deque
+import math
 
 class GoaltendingDetector:
-    """
-    ตรวจจับ Goaltending โดยวิเคราะห์ Trajectory ของบอล
-
-    Conditions ที่ต้องผ่านพร้อมกัน:
-        1. บอลอยู่เหนือระดับ Rim (y < frame_h * RIM_RATIO)
-        2. บอลกำลังเคลื่อนที่ลง (Downward)
-        3. บอลกำลังชะลอ (แสดงว่าใกล้จุดสูงสุดของ Arc แล้วตก)
-    """
-
-    HISTORY_LEN = 20     # เก็บประวัติกี่เฟรม
-    MIN_SAMPLES  = 8     # ต้องมีข้อมูลอย่างน้อยกี่เฟรมก่อนตัดสิน
-    RIM_RATIO    = 0.42  # สัดส่วน Y ของระดับห่วง (ปรับตามมุมกล้อง)
-    FALL_SPEED   = 8     # ความเร็ว Y (px/frame) ขั้นต่ำที่ถือว่า "ตก"
-
     def __init__(self):
-        self._y_history: deque = deque(maxlen=self.HISTORY_LEN)
+        self.HISTORY_LEN = 15     # เก็บประวัติ 15 เฟรมเพื่อสร้างกราฟ
+        self.MIN_SAMPLES = 8
+        self.RIM_RATIO = 0.42
+        self.HAND_BALL_THRESHOLD_PX = 80 # ระยะห่างระหว่างมือกับบอลที่ถือว่า "แตะ"
+        
+        self._y_history = deque(maxlen=self.HISTORY_LEN)
 
-    def check(self, ball_center, frame_h: int) -> tuple:
+    def check(self, ball_center, hands_positions, frame_h):
         """
-        Parameters:
-            ball_center : tuple (x, y) หรือ None
-            frame_h     : int — ความสูงของเฟรม (pixel)
-
-        Returns:
-            (is_violation: bool, message: str)
+        hands_positions: list ของ (x, y) ของมือผู้เล่นทุกคนในเฟรม (ดึงจาก MediaPipe)
         """
         if ball_center is None:
             self._y_history.clear()
@@ -52,26 +25,35 @@ class GoaltendingDetector:
         if len(self._y_history) < self.MIN_SAMPLES:
             return False, ""
 
-        rim_level = frame_h * self.RIM_RATIO
-
-        # ── Condition 1: บอลต้องอยู่เหนือระดับ Rim ──
-        if y >= rim_level:
+        # 1. เช็คความสูง (ต้องอยู่เหนือห่วง)
+        if y >= frame_h * self.RIM_RATIO:
             return False, ""
 
-        # ── Condition 2 & 3: วิเคราะห์ Velocity และ Trend ──
-        history = list(self._y_history)
-        velocities = [history[i+1] - history[i] for i in range(len(history)-1)]
+        # 2. สร้างสมการ Parabola (y = ax^2 + bx + c) จากประวัติ Y
+        # เนื่องจากพิกัด Y ของจอคอม ยิ่งลงล่างยิ่งค่าบวก กราฟลูกบาสตกพื้นจะเป็นตัว U หงาย (a > 0)
+        x_axis = np.arange(len(self._y_history))
+        y_axis = np.array(self._y_history)
+        a, b, c = np.polyfit(x_axis, y_axis, 2)
 
-        # ค่าเฉลี่ย Velocity ช่วงหลัง (ลบ = ขึ้น, บวก = ลง)
-        recent_vel = np.mean(velocities[-5:])
+        # ถ้า a > 0 แสดงว่าเป็นส่วนโค้งพาราโบลาหงาย (วิถีลูกบาส)
+        # และจุดล่าสุด y_axis[-1] > y_axis[-2] แสดงว่ากำลังอยู่ใน "ขาลง"
+        is_downward_arc = (a > 0.5) and (y_axis[-1] > y_axis[-2])
 
-        # บอลตก = Velocity เป็นบวก (Y เพิ่ม = ลงต่ำ)
-        is_falling = recent_vel > self.FALL_SPEED
+        if not is_downward_arc:
+            return False, ""
 
-        # ตรวจสอบว่าผ่าน Arc สูงสุดมาแล้ว (Velocity เคยเป็นลบแล้วกลายเป็นบวก)
-        peak_passed = any(v < -self.FALL_SPEED for v in velocities[:len(velocities)//2])
+        # 3. เช็คว่ามี "มือ" เข้าใกล้ลูกบาสในระยะที่กำหนดหรือไม่ (ป้องกันนกบินผ่าน)
+        is_touched = False
+        if hands_positions:
+            for hand_x, hand_y in hands_positions:
+                dist = math.hypot(hand_x - ball_center[0], hand_y - ball_center[1])
+                if dist < self.HAND_BALL_THRESHOLD_PX:
+                    is_touched = True
+                    break
 
-        if is_falling and peak_passed:
+        if is_downward_arc and is_touched:
+            # ล้างประวัติเพื่อไม่ให้เตือนซ้ำรัวๆ
+            self._y_history.clear() 
             return True, "GOALTENDING ⚠️"
 
         return False, ""
